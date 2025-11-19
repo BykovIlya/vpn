@@ -1,7 +1,6 @@
-# Проблемы
+# Troubleshooting
 
-## Не подключается
-
+## Cannot connect
 ```bash
 sudo systemctl status wg-quick@wg0
 sudo ss -ulpn | grep 51820
@@ -9,17 +8,16 @@ sudo ufw status
 sudo systemctl restart wg-quick@wg0
 ```
 
-## Мало места
-
+## Low disk space
 ```bash
 df -h
-sudo bash server/maintenance.sh
-sudo journalctl --vacuum=1d
+sudo bash ./maintenance.sh
+sudo journalctl --vacuum-time=1d
 ```
 
-## DNS не работает
-
+## DNS not working
+Check client's DNS line in its config:
 ```bash
-grep DNS /etc/wireguard/clients/device.conf
+grep DNS /etc/wireguard/clients/<device>.conf
 nslookup google.com
 ```

@@ -1,68 +1,107 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# --- Helpers ---
+info()    { echo -e "[INFO] $*"; }
+ok()      { echo -e "[OK]   $*"; }
+warn()    { echo -e "[WARN] $*"; }
+error()   { echo -e "[ERR]  $*" >&2; }
+need_root(){ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then error "This script must be run as root (sudo)."; exit 1; fi; }
 
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
-log_error() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+# Load .env if present (from current dir), else from /etc/wireguard if present
+load_env() {
+  local dotenv=".env"
+  if [[ -f "$dotenv" ]]; then
+    set -a; source "$dotenv"; set +a
+  elif [[ -f "/etc/wireguard/.env" ]]; then
+    set -a; source "/etc/wireguard/.env"; set +a
+  fi
+}
 
-[[ $EUID -ne 0 ]] && log_error "Требуются права администратора"
-[[ -z "${1:-}" ]] && log_error "sudo bash add-device.sh device_name"
+# Defaults (can be overridden by .env)
+: "${WG_INTERFACE:=wg0}"
+: "${WG_PORT:=51820}"
+: "${WG_NETWORK:=10.0.0.0/24}"
+: "${WG_DNS:=8.8.8.8, 1.1.1.1}"
+: "${WG_ENDPOINT_IP:=}"
+: "${WG_DIR:=/etc/wireguard}"
+: "${WG_CLIENTS_DIR:=/etc/wireguard/clients}"
+: "${ALLOW_SSH_PORT:=22}"
 
-DEVICE_NAME="$1"
-[[ ! "$DEVICE_NAME" =~ ^[a-zA-Z0-9_-]+$ ]] && log_error "Неверное имя"
+validate_device_name() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && { error "Device name is required."; return 1; }
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || { error "Invalid device name. Allowed: letters, numbers, underscore, hyphen."; return 1; }
+  return 0
+}
 
-WG_CONFIG="/etc/wireguard/wg0.conf"
-CLIENTS_DIR="/etc/wireguard/clients"
-CREDS_FILE="/etc/wireguard/.credentials"
+need_root
+load_env
 
-[[ ! -f "$WG_CONFIG" ]] && log_error "WireGuard не инициализирован"
+NAME="${1:-}"
+if ! validate_device_name "$NAME"; then
+  echo "Usage: sudo bash ./add-device.sh <device_name>"
+  exit 1
+fi
+
+WG_CONFIG="${WG_DIR}/wg0.conf"
+CREDS_FILE="${WG_DIR}/.credentials"
+
+[[ -f "$CREDS_FILE" ]] || { error "Missing credentials file: $CREDS_FILE"; exit 1; }
 source "$CREDS_FILE"
 
-log_info "Генерирование ключей..."
+[[ -f "$WG_CONFIG" ]] || { error "WireGuard not initialized. Missing $WG_CONFIG"; exit 1; }
+
+info "Generating keys..."
 DEVICE_PRIVKEY=$(wg genkey)
 DEVICE_PUBKEY=$(echo "$DEVICE_PRIVKEY" | wg pubkey)
 
-LAST_IP=$(grep -oP '10\.0\.0\.\K[0-9]+' "$WG_CONFIG" | sort -n | tail -1 || echo "1")
-DEVICE_IP="10.0.0.$((LAST_IP + 1))"
-[[ $((LAST_IP + 1)) -gt 254 ]] && log_error "IP исчерпаны"
+# Determine next IP (last octet)
+LAST_IP=$(grep -oE 'Address *= *10\.0\.0\.[0-9]+' "$WG_CONFIG" | awk -F. '{print $4}' | sort -n | tail -1)
+LAST_IP=${LAST_IP:-1}
+NEXT=$((LAST_IP + 1))
+if (( NEXT > 254 )); then
+  error "IP pool exhausted in 10.0.0.0/24"; exit 1
+fi
+DEVICE_IP="10.0.0.${NEXT}"
+ok "Assigned IP: ${DEVICE_IP}"
 
-log_success "IP: $DEVICE_IP"
+# Append peer
+{
+  echo ""
+  echo "# Device: ${NAME}"
+  echo "[Peer]"
+  echo "PublicKey = ${DEVICE_PUBKEY}"
+  echo "AllowedIPs = ${DEVICE_IP}/32"
+} >> "$WG_CONFIG"
 
-cat >> "$WG_CONFIG" << EOF
+systemctl restart wg-quick@"${WG_INTERFACE}"
 
-# Device: $DEVICE_NAME
-[Peer]
-PublicKey = $DEVICE_PUBKEY
-AllowedIPs = $DEVICE_IP/32
-EOF
-
-systemctl restart wg-quick@wg0
-
-CLIENT_CONF="$CLIENTS_DIR/${DEVICE_NAME}.conf"
-cat > "$CLIENT_CONF" << EOF
+CLIENT_CONF="${WG_CLIENTS_DIR}/${NAME}.conf"
+cat > "$CLIENT_CONF" <<EOF
 [Interface]
-PrivateKey = $DEVICE_PRIVKEY
-Address = $DEVICE_IP/24
-DNS = 8.8.8.8, 1.1.1.1
+PrivateKey = ${DEVICE_PRIVKEY}
+Address = ${DEVICE_IP}/24
+DNS = ${WG_DNS}
 MTU = 1420
 
 [Peer]
-PublicKey = $SERVER_PUBKEY
+PublicKey = ${SERVER_PUBKEY}
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = $SERVER_IP:51820
+Endpoint = ${SERVER_IP}:${WG_PORT}
 PersistentKeepalive = 20
 EOF
 
 chmod 600 "$CLIENT_CONF"
 
-command -v qrencode &> /dev/null && qrencode -t ansiutf8 < "$CLIENT_CONF"
+if command -v qrencode >/dev/null 2>&1; then
+  echo
+  echo "Scan this QR with your WireGuard mobile app:"
+  qrencode -t ansiutf8 < "$CLIENT_CONF" || true
+  echo
+fi
 
-echo "✅ Устройство добавлено!"
-echo "Имя: $DEVICE_NAME"
-echo "IP: $DEVICE_IP"
-echo "Конфиг: $CLIENT_CONF"
+ok "Device added."
+echo "Name:   ${NAME}"
+echo "IP:     ${DEVICE_IP}"
+echo "Config: ${CLIENT_CONF}"

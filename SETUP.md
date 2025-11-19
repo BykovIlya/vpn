@@ -1,34 +1,47 @@
-# Установка
+# Setup
 
-## Требования
+> Single-folder layout: all scripts and docs can live in one directory on the server.
+
+## Requirements
 - Ubuntu 20.04+ / Debian 11+
-- 1GB+ RAM
-- 10GB+ SSD
-- Публичный IP
+- Root (sudo) access
+- 1 GB RAM, 10 GB disk
+- Public IP address
 
-## Установка
+## 1) Copy files
+Upload all files from this folder to the server (any directory).
 
+Optionally create a `.env` next to the scripts (see `.env.example`).
+
+## 2) Install WireGuard and configure server
 ```bash
-git clone https://github.com/your-user/vpn-project.git
-cd vpn-project
-sudo bash server/install.sh
+sudo bash ./install.sh
 ```
 
-## Добавление устройств
+This will:
+- Install packages (wireguard, ufw, qrencode, etc.)
+- Enable IP forwarding
+- Create `/etc/wireguard/wg0.conf`
+- Generate server keys and save them in `/etc/wireguard/.credentials`
+- Start and enable the WireGuard interface
+- Configure UFW to allow SSH and WireGuard UDP port
 
+## 3) Add devices
 ```bash
-sudo bash client/add-device.sh person1_phone
-sudo bash client/add-device.sh person1_laptop
-sudo bash client/add-device.sh person2_phone
-sudo bash client/add-device.sh person2_laptop
-sudo bash client/add-device.sh person2_tablet
+sudo bash ./add-device.sh alice_phone
+sudo bash ./add-device.sh alice_laptop
+sudo bash ./add-device.sh bob_phone
 ```
 
-## Проверка
-
+## 4) Inspect status
 ```bash
+sudo bash ./status.sh
 sudo wg show wg0
-sudo bash client/status.sh
 ```
 
-Смотрите docs/USAGE.md и docs/TROUBLESHOOTING.md
+## 5) Maintenance (optional)
+```bash
+sudo bash ./maintenance.sh
+```
+
+See `USAGE.md` and `TROUBLESHOOTING.md` for more.

@@ -1,82 +1,122 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# --- Helpers ---
+info()    { echo -e "[INFO] $*"; }
+ok()      { echo -e "[OK]   $*"; }
+warn()    { echo -e "[WARN] $*"; }
+error()   { echo -e "[ERR]  $*" >&2; }
+need_root(){ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then error "This script must be run as root (sudo)."; exit 1; fi; }
 
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
-log_error() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+# Load .env if present (from current dir), else from /etc/wireguard if present
+load_env() {
+  local dotenv=".env"
+  if [[ -f "$dotenv" ]]; then
+    set -a; source "$dotenv"; set +a
+  elif [[ -f "/etc/wireguard/.env" ]]; then
+    set -a; source "/etc/wireguard/.env"; set +a
+  fi
+}
 
-[[ $EUID -ne 0 ]] && log_error "Требуются права администратора"
+# Defaults (can be overridden by .env)
+: "${WG_INTERFACE:=wg0}"
+: "${WG_PORT:=51820}"
+: "${WG_NETWORK:=10.0.0.0/24}"
+: "${WG_DNS:=8.8.8.8, 1.1.1.1}"
+: "${WG_ENDPOINT_IP:=}"
+: "${WG_DIR:=/etc/wireguard}"
+: "${WG_CLIENTS_DIR:=/etc/wireguard/clients}"
+: "${ALLOW_SSH_PORT:=22}"
 
-source /etc/os-release
-[[ "$ID" != "ubuntu" && "$ID" != "debian" ]] && log_error "Только Ubuntu/Debian"
+validate_device_name() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && { error "Device name is required."; return 1; }
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || { error "Invalid device name. Allowed: letters, numbers, underscore, hyphen."; return 1; }
+  return 0
+}
 
-log_info "Установка пакетов..."
+need_root
+load_env
+
+info "Detecting OS..."
+source /etc/os-release || { error "Unsupported system: missing /etc/os-release"; exit 1; }
+if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+  error "This installer supports Ubuntu/Debian only."; exit 1
+fi
+
+info "Installing packages..."
+export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq
 apt-get install -y -qq wireguard wireguard-tools linux-headers-"$(uname -r)" curl wget git ufw qrencode jq net-tools iptables-persistent
 
-log_info "Kernel параметры..."
-sysctl -w net.ipv4.ip_forward=1 > /dev/null
-sysctl -w net.ipv6.conf.all.forwarding=1 > /dev/null
-echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
-sysctl -p > /dev/null
+info "Enabling IP forwarding..."
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+grep -q 'net.ipv6.conf.all.forwarding=1' /etc/sysctl.conf || echo 'net.ipv6.conf.all.forwarding=1' >> /etc/sysctl.conf
+sysctl -p >/dev/null || true
 
-log_info "WireGuard инициализация..."
-mkdir -p /etc/wireguard/clients
-chmod 700 /etc/wireguard
-cd /etc/wireguard
+info "Preparing directories..."
+mkdir -p "$WG_CLIENTS_DIR"
+chmod 700 "$WG_DIR"
 
+cd "$WG_DIR"
+
+info "Generating server keys..."
 SERVER_PRIVKEY=$(wg genkey)
 SERVER_PUBKEY=$(echo "$SERVER_PRIVKEY" | wg pubkey)
-SERVER_IP=$(curl -s https://checkip.amazonaws.com | xargs) || SERVER_IP="0.0.0.0"
 
-cat > /etc/wireguard/wg0.conf << 'EOF'
+if [[ -z "$WG_ENDPOINT_IP" ]]; then
+  info "Autodetecting external IP..."
+  WG_ENDPOINT_IP=$(curl -s https://checkip.amazonaws.com || true)
+  WG_ENDPOINT_IP=${WG_ENDPOINT_IP//$'\n'/}
+  [[ -z "$WG_ENDPOINT_IP" ]] && { warn "Failed to autodetect external IP. You can set WG_ENDPOINT_IP in .env"; WG_ENDPOINT_IP="0.0.0.0"; }
+fi
+
+# Choose default egress interface (best effort)
+EGRESS_IF=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || echo "eth0")
+
+cat > "$WG_DIR/wg0.conf" <<EOF
 [Interface]
-Address = 10.0.0.1/24
-PrivateKey = SERVER_PRIVKEY_PLACEHOLDER
-ListenPort = 51820
-SaveCounter = true
-DNS = 8.8.8.8, 1.1.1.1
+Address = ${WG_NETWORK%/*}.1/24
+PrivateKey = ${SERVER_PRIVKEY}
+ListenPort = ${WG_PORT}
+SaveConfig = true
+DNS = ${WG_DNS}
 
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; ip6tables -A FORWARD -i wg0 -j ACCEPT; ip6tables -A FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; ip6tables -D FORWARD -i wg0 -j ACCEPT; ip6tables -D FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+PostUp = iptables -A FORWARD -i ${WG_INTERFACE} -j ACCEPT; iptables -A FORWARD -o ${WG_INTERFACE} -j ACCEPT; iptables -t nat -A POSTROUTING -o ${EGRESS_IF} -j MASQUERADE; ip6tables -A FORWARD -i ${WG_INTERFACE} -j ACCEPT; ip6tables -A FORWARD -o ${WG_INTERFACE} -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${EGRESS_IF} -j MASQUERADE
+PostDown = iptables -D FORWARD -i ${WG_INTERFACE} -j ACCEPT; iptables -D FORWARD -o ${WG_INTERFACE} -j ACCEPT; iptables -t nat -D POSTROUTING -o ${EGRESS_IF} -j MASQUERADE; ip6tables -D FORWARD -i ${WG_INTERFACE} -j ACCEPT; ip6tables -D FORWARD -o ${WGRESS_IF} -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${EGRESS_IF} -j MASQUERADE
 EOF
 
-sed -i "s|SERVER_PRIVKEY_PLACEHOLDER|$SERVER_PRIVKEY|g" /etc/wireguard/wg0.conf
-chmod 600 /etc/wireguard/wg0.conf
+chmod 600 "$WG_DIR/wg0.conf"
 
-systemctl enable wg-quick@wg0 > /dev/null 2>&1
-systemctl start wg-quick@wg0
+# Persist env for other scripts (optional)
+cp -f "${PWD}/.env" "$WG_DIR/.env" 2>/dev/null || true
 
-sleep 2
-systemctl is-active --quiet wg-quick@wg0 || log_error "WireGuard не запустился"
-
-cat > /etc/wireguard/.credentials << EOF
-SERVER_PRIVKEY=$SERVER_PRIVKEY
-SERVER_PUBKEY=$SERVER_PUBKEY
-SERVER_IP=$SERVER_IP
+cat > "$WG_DIR/.credentials" <<EOF
+SERVER_PRIVKEY=${SERVER_PRIVKEY}
+SERVER_PUBKEY=${SERVER_PUBKEY}
+SERVER_IP=${WG_ENDPOINT_IP}
 EOF
-chmod 600 /etc/wireguard/.credentials
+chmod 600 "$WG_DIR/.credentials"
 
-log_info "Firewall..."
-ufw --force reset > /dev/null 2>&1 || true
+info "Enabling service..."
+systemctl enable wg-quick@"${WG_INTERFACE}" >/dev/null 2>&1 || true
+systemctl restart wg-quick@"${WG_INTERFACE}" || { error "Failed to start WireGuard"; exit 1; }
+
+info "Configuring firewall (ufw)..."
+ufw --force reset >/dev/null 2>&1 || true
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow 22/tcp comment "SSH"
-ufw allow 51820/udp comment "WireGuard"
-echo "y" | ufw enable > /dev/null 2>&1
+ufw allow ${ALLOW_SSH_PORT}/tcp comment "SSH"
+ufw allow ${WG_PORT}/udp comment "WireGuard"
+echo "y" | ufw enable >/dev/null 2>&1 || true
 
-log_success "✅ VPN Server установлен!"
+ok "VPN server installed successfully."
 echo ""
-echo "Public Key: $SERVER_PUBKEY"
-echo "External IP: $SERVER_IP"
+echo "Public Key: ${SERVER_PUBKEY}"
+echo "External IP: ${WG_ENDPOINT_IP}"
 echo ""
-echo "Добавьте устройства:"
-echo "sudo bash client/add-device.sh device_name"
-echo ""
+echo "Add devices with:"
+echo "  sudo bash ./add-device.sh <device_name>"

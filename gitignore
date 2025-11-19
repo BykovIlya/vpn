@@ -3,3 +3,4 @@
 *.pub
 *.log
 .credentials
+*.env*
